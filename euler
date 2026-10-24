@@ -1,0 +1,118 @@
+#!/usr/bin/env bun
+/**
+ * Project Euler helper: fetch problems and check answers without exposing them.
+ *
+ *   ./euler next              fetch the problem after the highest one in problems/
+ *   ./euler fetch N           fetch problem N
+ *   ./euler run N             build and run problem N in release mode, then check its last output line
+ *   ./euler check N [ANSWER]  check an answer (reads the last stdin line if ANSWER is omitted)
+ */
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
+
+const ROOT = import.meta.dir;
+const PROBLEMS = join(ROOT, "problems");
+const HASHES = join(ROOT, ".cache", "answers.sha256.json");
+const BASE = "https://projecteuler.net";
+const SOLUTIONS_URL =
+  "https://raw.githubusercontent.com/lucky-bai/projecteuler-solutions/master/Solutions.md";
+
+const die = (msg: string): never => {
+  console.error(msg);
+  process.exit(1);
+};
+
+async function get(url: string): Promise<Response> {
+  const res = await fetch(url, { headers: { "User-Agent": "euler-cli" } });
+  if (!res.ok) die(`GET ${url} -> ${res.status}`);
+  return res;
+}
+
+const digest = (answer: string) =>
+  new Bun.CryptoHasher("sha256").update(answer.trim()).digest("hex");
+
+const problemDir = (n: number) => join(PROBLEMS, String(n).padStart(4, "0"));
+const crateName = (n: number) => `p${String(n).padStart(4, "0")}`;
+
+async function fetchProblem(n: number) {
+  const index = (await (await get(`${BASE}/minimal=problems`)).text()).split("\n").slice(1);
+  const titles = new Map(
+    index.filter(Boolean).map((row) => {
+      const [id, title] = row.split("##");
+      return [Number(id), title] as const;
+    }),
+  );
+  const title = titles.get(n) ?? die(`Problem ${n} is not published yet (latest: ${titles.size}).`);
+
+  const dir = problemDir(n);
+  if (existsSync(dir)) die(`${dir} already exists.`);
+  mkdirSync(dir, { recursive: true });
+
+  let html = await (await get(`${BASE}/minimal=${n}`)).text();
+  for (const [match, attr, path] of html.matchAll(/(href|src)="(resources\/[^"]+)"/g)) {
+    const name = basename(path.split("?")[0]);
+    await Bun.write(join(dir, name), await get(`${BASE}/${path}`));
+    html = html.replace(match, `${attr}="${name}"`);
+  }
+
+  await Bun.write(
+    join(dir, "README.md"),
+    `# Problem ${n}: ${title}\n\n<${BASE}/problem=${n}>\n\n${html.trim()}\n`,
+  );
+  await Bun.write(
+    join(dir, "Cargo.toml"),
+    `[package]\nname = "${crateName(n)}"\nversion = "0.1.0"\nedition = "2024"\n`,
+  );
+  await Bun.write(join(dir, "src", "main.rs"), `fn main() {\n    todo!()\n}\n`);
+  console.log(`Fetched problem ${n}: ${title} -> problems/${basename(dir)}/`);
+}
+
+async function nextProblem() {
+  const done = readdirSync(PROBLEMS).filter((d) => /^\d+$/.test(d)).map(Number);
+  await fetchProblem(Math.max(0, ...done) + 1);
+}
+
+async function loadHashes(): Promise<Record<string, string>> {
+  const file = Bun.file(HASHES);
+  if (await file.exists()) return file.json();
+  // Only hashes are persisted; plaintext answers never touch disk or stdout.
+  const text = await (await get(SOLUTIONS_URL)).text();
+  const hashes: Record<string, string> = {};
+  for (const [, id, answer] of text.matchAll(/^(\d+)\. (.+)$/gm)) hashes[id] = digest(answer);
+  await Bun.write(HASHES, JSON.stringify(hashes));
+  return hashes;
+}
+
+async function check(n: number, answer: string) {
+  const expected = (await loadHashes())[String(n)];
+  if (!expected) die(`No reference answer for problem ${n}; submit it on ${BASE}/problem=${n}.`);
+  if (digest(answer) !== expected) die(`Problem ${n}: wrong ❌`);
+  console.log(`Problem ${n}: correct ✅`);
+  if (existsSync(problemDir(n))) await Bun.write(join(problemDir(n), ".solved"), "");
+}
+
+async function run(n: number) {
+  const proc = Bun.spawn(["cargo", "run", "--release", "--quiet", "-p", crateName(n)], {
+    cwd: ROOT,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const start = performance.now();
+  const output = await new Response(proc.stdout).text();
+  if ((await proc.exited) !== 0) die(`Problem ${n}: run failed`);
+  console.error(`(build + run: ${((performance.now() - start) / 1000).toFixed(2)}s)`);
+  const result = output.trim().split("\n").at(-1) ?? "";
+  console.log(`Answer: ${result} (copied to clipboard)`);
+  await Bun.spawn(["pbcopy"], { stdin: new Blob([result]) }).exited;
+  await check(n, result);
+  await Bun.spawn(["open", `${BASE}/problem=${n}`], { stdout: "inherit" }).exited;
+}
+
+const [cmd, n, answer] = process.argv.slice(2);
+if (cmd === "next" && !n) await nextProblem();
+else if (cmd === "run" && n) await run(Number(n));
+else if (cmd === "fetch" && n) await fetchProblem(Number(n));
+else if (cmd === "check" && n) {
+  const input = answer ?? (await Bun.stdin.text()).trim().split("\n").at(-1) ?? "";
+  await check(Number(n), input);
+} else die("usage: ./euler next | fetch N | run N | check N [ANSWER]");
