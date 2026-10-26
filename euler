@@ -104,8 +104,10 @@ async function run(n: number) {
   const result = output.trim().split("\n").at(-1) ?? "";
   console.log(`Answer: ${result} (copied to clipboard)`);
   await Bun.spawn(["pbcopy"], { stdin: new Blob([result]) }).exited;
+  const alreadySolved = existsSync(join(problemDir(n), ".solved"));
   await check(n, result);
-  await Bun.spawn(["open", `${BASE}/problem=${n}`], { stdout: "inherit" }).exited;
+  if (!alreadySolved)
+    await Bun.spawn(["open", `${BASE}/problem=${n}`], { stdout: "inherit" }).exited;
 }
 
 const [cmd, n, answer] = process.argv.slice(2);
